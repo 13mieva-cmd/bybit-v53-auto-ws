@@ -30,7 +30,7 @@ function ema(vals, period){ if(!vals.length) return []; const k=2/(period+1); le
 function atr(candles, period=14){ const tr=[]; for(let i=0;i<candles.length;i++){ const c=candles[i], h=f(c.high), l=f(c.low); if(i===0) tr.push(h-l); else { const pc=f(candles[i-1].close); tr.push(Math.max(h-l, Math.abs(h-pc), Math.abs(l-pc))); } } return ema(tr, period); }
 function pct(a,b){ return b ? (a/b)*100 : 0; }
 function httpGet(url, headers={}){ return new Promise((resolve,reject)=>{ https.get(url, {headers:{'User-Agent':'bybit-v5.3/1.0', ...headers}}, res => { let data=''; res.on('data', c=>data += c); res.on('end', ()=>resolve({statusCode:res.statusCode, data})); }).on('error', reject); }); }
-function get(path){ return httpGet(REST + path, {'Accept':'application/json'}).then(r => { if(r.statusCode && r.statusCode >= 400) throw new Error(`HTTP ${r.statusCode}: ${r.data.slice(0,180)}`); const j = JSON.parse(r.data); if(String(j.retCode) !== '0') throw new Error(JSON.stringify(j)); return j.result; }); }
+function get(path){ return httpGet(REST + path, {'Accept':'application/json'}).then(r => { if(r.statusCode && r.statusCode >= 400) { const e = new Error(`HTTP ${r.statusCode}: ${r.data.slice(0,180)}`); e.statusCode = r.statusCode; throw e; } const j = JSON.parse(r.data); if(String(j.retCode) !== '0') { const e = new Error(JSON.stringify(j)); e.retCode = j.retCode; throw e; } return j.result; }); }
 function postTelegram(text){ return new Promise((resolve,reject)=>{ if(!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return resolve(false); const body = JSON.stringify({chat_id:TELEGRAM_CHAT_ID, text, parse_mode:'HTML', disable_web_page_preview:true}); const req = https.request({method:'POST', hostname:'api.telegram.org', path:`/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, headers:{'Content-Type':'application/json','Content-Length':Buffer.byteLength(body)}}, res => { res.resume(); res.on('end', ()=>resolve(res.statusCode >= 200 && res.statusCode < 300)); }); req.on('error', reject); req.write(body); req.end(); }); }
 function loadState(){ try { return JSON.parse(fs.readFileSync(STATE_FILE,'utf8')); } catch { return {seenNews:[], lastAlert:'', cache:{}, symbols:[], wsSubscribed:{}, newsSet:[]}; } }
 function saveState(s){ fs.writeFileSync(STATE_FILE, JSON.stringify(s, null, 2)); }
@@ -43,7 +43,10 @@ async function fetchAnnouncements(){
     const out = new Set();
     let m; while((m = re.exec(html)) !== null) out.add(m[1] + 'USDT');
     return [...out];
-  } catch { return []; }
+  } catch (e) {
+    log(`ANN ERR ${e.message}`);
+    return [];
+  }
 }
 
 async function fetchUniverse(){
@@ -116,21 +119,26 @@ async function updateNews(state){
 }
 
 async function evaluate(state){
-  const universe = await fetchUniverse();
+  let universe = [];
+  try { universe = await fetchUniverse(); } catch (e) { log(`UNIVERSE ERR ${e.message}`); }
   const results = [];
   for(const row of universe.slice(0, 25)){
-    const k15 = await fetchKlines(row.symbol, '15', 120);
-    const k60 = await fetchKlines(row.symbol, '60', 120);
-    if(k15.length < 60 || k60.length < 60) continue;
-    const wsTick = state.cache[row.symbol] || null;
-    const sig = scoreSignal(row, k15, k60, (state.newsSet || []).includes(row.symbol), wsTick);
-    results.push(sig);
-    if(sig.status === 'LONG'){
-      const fp = `${sig.symbol}:${sig.score}:${sig.entry}`;
-      if(state.lastAlert !== fp){
-        state.lastAlert = fp;
-        await postTelegram(tg(sig));
+    try {
+      const k15 = await fetchKlines(row.symbol, '15', 120);
+      const k60 = await fetchKlines(row.symbol, '60', 120);
+      if(k15.length < 60 || k60.length < 60) continue;
+      const wsTick = state.cache[row.symbol] || null;
+      const sig = scoreSignal(row, k15, k60, (state.newsSet || []).includes(row.symbol), wsTick);
+      results.push(sig);
+      if(sig.status === 'LONG'){
+        const fp = `${sig.symbol}:${sig.score}:${sig.entry}`;
+        if(state.lastAlert !== fp){
+          state.lastAlert = fp;
+          await postTelegram(tg(sig));
+        }
       }
+    } catch (e) {
+      log(`SYMBOL ERR ${row.symbol} ${e.message}`);
     }
   }
   results.sort((a,b) => b.score - a.score);
