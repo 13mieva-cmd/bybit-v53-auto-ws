@@ -9,6 +9,7 @@ fs.mkdirSync('output', { recursive: true });
 const REST = 'https://api.bybit.com';
 const WS = 'wss://stream.bybit.com/v5/public/spot';
 const ANN_URL = 'https://announcements.bybit.com/en/?category=new_crypto';
+
 const REST_REFRESH_MS = Number(process.env.REST_REFRESH_MS || 30000);
 const ANN_REFRESH_MS = Number(process.env.ANN_REFRESH_MS || 60000);
 const ALERT_SCORE = Number(process.env.ALERT_SCORE || 72);
@@ -18,6 +19,7 @@ const ONLY_NEW_DAYS = Number(process.env.ONLY_NEW_DAYS || 90);
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
 const WATCHLIST = (process.env.WATCHLIST || '').split(',').map(s => s.trim().toUpperCase()).filter(Boolean);
+
 const STATE_FILE = 'output/bybit_v53_state.json';
 const SNAPSHOT_FILE = 'output/bybit_v53_snapshot.json';
 const LOG_FILE = 'output/bybit_v53_signals.log';
@@ -29,13 +31,36 @@ function f(v,d=0){ const n=Number(v); return Number.isFinite(n) ? n : d; }
 function clamp(n,a,b){ return Math.max(a, Math.min(b,n)); }
 function mean(a){ return a.length ? a.reduce((s,x)=>s+x,0)/a.length : 0; }
 function std(a){ const m=mean(a); return a.length ? Math.sqrt(mean(a.map(x => (x-m)*(x-m)))) : 0; }
-function ema(vals, period){ if(!vals.length) return []; const k=2/(period+1); let prev=vals[0]; const out=[prev]; for(let i=1;i<vals.length;i++){ prev = vals[i]*k + prev*(1-k); out.push(prev); } return out; }
-function atr(candles, period=14){ const trs=[]; for(let i=1;i<candles.length;i++){ const c=candles[i], p=candles[i-1]; trs.push(Math.max(c.high-c.low, Math.abs(c.high-p.close), Math.abs(c.low-p.close))); } return ema(trs, period); }
+function ema(vals, period){
+  if(!vals.length) return [];
+  const k=2/(period+1);
+  let prev=vals[0];
+  const out=[prev];
+  for(let i=1;i<vals.length;i++){ prev = vals[i]*k + prev*(1-k); out.push(prev); }
+  return out;
+}
+function atr(candles, period=14){
+  const trs=[];
+  for(let i=1;i<candles.length;i++){
+    const c=candles[i], p=candles[i-1];
+    trs.push(Math.max(c.high-c.low, Math.abs(c.high-p.close), Math.abs(c.low-p.close)));
+  }
+  return ema(trs, period);
+}
 function pct(a,b){ return b ? (a/b)*100 : 0; }
 
 function httpGet(url, headers={}){
   return new Promise((resolve,reject)=>{
-    https.get(url, {headers:{'User-Agent':'bybit-v5.3/1.0', ...headers}}, res => {
+    const u = new URL(url);
+    const path = u.pathname + u.search;
+    https.get({
+      protocol: u.protocol,
+      hostname: u.hostname,
+      port: u.port || 443,
+      path,
+      method: 'GET',
+      headers: {'User-Agent':'bybit-v5.3/1.0', ...headers}
+    }, res => {
       let data='';
       res.on('data', c=>data += c);
       res.on('end', ()=>resolve({statusCode:res.statusCode, data}));
@@ -44,7 +69,8 @@ function httpGet(url, headers={}){
 }
 
 function get(path){
-  return httpGet(REST + path, {'Accept':'application/json'}).then(r => {
+  const safePath = path.replace(/\s/g, '%20');
+  return httpGet(REST + safePath, {'Accept':'application/json'}).then(r => {
     if(r.statusCode && r.statusCode >= 400) {
       const e = new Error(`HTTP ${r.statusCode}: ${r.data.slice(0,180)}`);
       e.statusCode = r.statusCode;
@@ -133,7 +159,8 @@ async function fetchUniverse(){
 }
 
 async function fetchKlines(symbol, interval, limit=120){
-  const res = await get(`/v5/market/kline?category=spot&symbol=${encodeURIComponent(symbol)}&interval=${interval}&limit=${limit}`);
+  const sym = encodeURIComponent(symbol);
+  const res = await get(`/v5/market/kline?category=spot&symbol=${sym}&interval=${encodeURIComponent(String(interval))}&limit=${limit}`);
   return (res.list || []).map(x => ({
     start:Number(x[0]),
     open:Number(x[1]),
