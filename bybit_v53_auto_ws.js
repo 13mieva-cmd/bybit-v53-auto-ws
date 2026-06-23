@@ -1,12 +1,15 @@
 #!/usr/bin/env node
 const https = require('https');
+const http = require('http');
 const fs = require('fs');
 const WebSocket = require('ws');
+
 fs.mkdirSync('output', { recursive: true });
 
 const REST = 'https://api.bybit.com';
 const WS = 'wss://stream.bybit.com/v5/public/spot';
 const ANN_URL = 'https://announcements.bybit.com/en/?category=new_crypto';
+
 const REST_REFRESH_MS = Number(process.env.REST_REFRESH_MS || 30000);
 const ANN_REFRESH_MS = Number(process.env.ANN_REFRESH_MS || 60000);
 const ALERT_SCORE = Number(process.env.ALERT_SCORE || 72);
@@ -16,9 +19,11 @@ const ONLY_NEW_DAYS = Number(process.env.ONLY_NEW_DAYS || 90);
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
 const WATCHLIST = (process.env.WATCHLIST || '').split(',').map(s => s.trim().toUpperCase()).filter(Boolean);
+
 const STATE_FILE = 'output/bybit_v53_state.json';
 const SNAPSHOT_FILE = 'output/bybit_v53_snapshot.json';
 const LOG_FILE = 'output/bybit_v53_signals.log';
+const PORT = process.env.PORT || 10000;
 
 function now(){ return new Date().toISOString(); }
 function log(msg){ const line = `[${now()}] ${msg}`; console.log(line); fs.appendFileSync(LOG_FILE, line + '\n'); }
@@ -27,12 +32,67 @@ function clamp(n,a,b){ return Math.max(a, Math.min(b,n)); }
 function mean(a){ return a.length ? a.reduce((s,x)=>s+x,0)/a.length : 0; }
 function std(a){ const m=mean(a); return a.length ? Math.sqrt(mean(a.map(x => (x-m)*(x-m)))) : 0; }
 function ema(vals, period){ if(!vals.length) return []; const k=2/(period+1); let prev=vals[0]; const out=[prev]; for(let i=1;i<vals.length;i++){ prev = vals[i]*k + prev*(1-k); out.push(prev); } return out; }
-function atr(candles, period=14){ const tr=[]; for(let i=0;i<candles.length;i++){ const c=candles[i], h=f(c.high), l=f(c.low); if(i===0) tr.push(h-l); else { const pc=f(candles[i-1].close); tr.push(Math.max(h-l, Math.abs(h-pc), Math.abs(l-pc))); } } return ema(tr, period); }
+function atr(candles, period=14){ const trs=[]; for(let i=1;i<candles.length;i++){ const c=candles[i], p=candles[i-1]; trs.push(Math.max(c.high-c.low, Math.abs(c.high-p.close), Math.abs(c.low-p.close))); } return ema(trs, period); }
 function pct(a,b){ return b ? (a/b)*100 : 0; }
-function httpGet(url, headers={}){ return new Promise((resolve,reject)=>{ https.get(url, {headers:{'User-Agent':'bybit-v5.3/1.0', ...headers}}, res => { let data=''; res.on('data', c=>data += c); res.on('end', ()=>resolve({statusCode:res.statusCode, data})); }).on('error', reject); }); }
-function get(path){ return httpGet(REST + path, {'Accept':'application/json'}).then(r => { if(r.statusCode && r.statusCode >= 400) throw new Error(`HTTP ${r.statusCode}: ${r.data.slice(0,180)}`); const j = JSON.parse(r.data); if(String(j.retCode) !== '0') throw new Error(JSON.stringify(j)); return j.result; }); }
-function postTelegram(text){ return new Promise((resolve,reject)=>{ if(!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return resolve(false); const body = JSON.stringify({chat_id:TELEGRAM_CHAT_ID, text, parse_mode:'HTML', disable_web_page_preview:true}); const req = https.request({method:'POST', hostname:'api.telegram.org', path:`/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, headers:{'Content-Type':'application/json','Content-Length':Buffer.byteLength(body)}}, res => { res.resume(); res.on('end', ()=>resolve(res.statusCode >= 200 && res.statusCode < 300)); }); req.on('error', reject); req.write(body); req.end(); }); }
-function loadState(){ try { return JSON.parse(fs.readFileSync(STATE_FILE,'utf8')); } catch { return {seenNews:[], lastAlert:'', cache:{}, symbols:[], wsSubscribed:{}, newsSet:[]}; } }
+
+function httpGet(url, headers={}){
+  return new Promise((resolve,reject)=>{
+    const u = new URL(url);
+    https.get({
+      protocol: u.protocol,
+      hostname: u.hostname,
+      port: u.port || 443,
+      path: u.pathname + u.search,
+      method: 'GET',
+      headers: {'User-Agent':'bybit-v5.3/1.0', ...headers}
+    }, res => {
+      let data='';
+      res.on('data', c=>data += c);
+      res.on('end', ()=>resolve({statusCode:res.statusCode, data}));
+    }).on('error', reject);
+  });
+}
+
+function get(path){
+  return httpGet(REST + path, {'Accept':'application/json'}).then(r => {
+    if(r.statusCode && r.statusCode >= 400) {
+      const e = new Error(`HTTP ${r.statusCode}: ${r.data.slice(0,180)}`);
+      e.statusCode = r.statusCode;
+      throw e;
+    }
+    const j = JSON.parse(r.data);
+    if(String(j.retCode) !== '0') {
+      const e = new Error(JSON.stringify(j));
+      e.retCode = j.retCode;
+      throw e;
+    }
+    return j.result;
+  });
+}
+
+function postTelegram(text){
+  return new Promise((resolve,reject)=>{
+    if(!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return resolve(false);
+    const body = JSON.stringify({chat_id:TELEGRAM_CHAT_ID, text, parse_mode:'HTML', disable_web_page_preview:true});
+    const req = https.request({
+      method:'POST',
+      hostname:'api.telegram.org',
+      path:`/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
+      headers:{'Content-Type':'application/json','Content-Length':Buffer.byteLength(body)}
+    }, res => {
+      res.resume();
+      res.on('end', ()=>resolve(res.statusCode >= 200 && res.statusCode < 300));
+    });
+    req.on('error', reject);
+    req.write(body);
+    req.end();
+  });
+}
+
+function loadState(){
+  try { return JSON.parse(fs.readFileSync(STATE_FILE,'utf8')); }
+  catch { return {seenNews:[], lastAlert:'', cache:{}, symbols:[], wsSubscribed:{}, newsSet:[]}; }
+}
 function saveState(s){ fs.writeFileSync(STATE_FILE, JSON.stringify(s, null, 2)); }
 
 async function fetchAnnouncements(){
@@ -41,9 +101,13 @@ async function fetchAnnouncements(){
     const html = r.data || '';
     const re = /\b([A-Z0-9]{2,15})USDT\b/g;
     const out = new Set();
-    let m; while((m = re.exec(html)) !== null) out.add(m[1] + 'USDT');
+    let m;
+    while((m = re.exec(html)) !== null) out.add(m[1] + 'USDT');
     return [...out];
-  } catch { return []; }
+  } catch (e) {
+    log(`ANN ERR ${e.message}`);
+    return [];
+  }
 }
 
 async function fetchUniverse(){
@@ -65,7 +129,7 @@ async function fetchUniverse(){
 }
 
 async function fetchKlines(symbol, interval, limit=120){
-  const res = await get(`/v5/market/kline?category=spot&symbol=${encodeURIComponent(symbol)}&interval=${interval}&limit=${limit}`);
+  const res = await get(`/v5/market/kline?category=spot&symbol=${encodeURIComponent(symbol)}&interval=${encodeURIComponent(String(interval))}&limit=${limit}`);
   return (res.list || []).map(x => ({ start:Number(x[0]), open:Number(x[1]), high:Number(x[2]), low:Number(x[3]), close:Number(x[4]), volume:Number(x[5]) })).reverse();
 }
 
@@ -97,9 +161,10 @@ function scoreSignal(row, k15, k60, news, wsTick){
   const risk = Math.max(entry - stop, 1e-8);
   const tp1 = entry + risk * 1.5;
   const tp2 = entry + risk * 2.5;
-  return {symbol: row.symbol, baseCoin:row.baseCoin, status, score, news, bullish1h, bullish15, breakout, retest, volSpike:+volSpike.toFixed(2), atrSpike:+atrSpike.toFixed(2), spreadPct:+spreadPct.toFixed(2), wsMom:+wsMom.toFixed(2), entry:+entry.toFixed(8), stop:+stop.toFixed(8), tp1:+tp1.toFixed(8), tp2:+tp2.toFixed(8), last_price:row.last_price, change24h_pct:row.change24h_pct, turnover24h_usdt:row.turnover24h_usdt, age_days:row.age_days};
+  return { symbol: row.symbol, baseCoin:row.baseCoin, status, score, news, bullish1h, bullish15, breakout, retest, volSpike:+volSpike.toFixed(2), atrSpike:+atrSpike.toFixed(2), spreadPct:+spreadPct.toFixed(2), wsMom:+wsMom.toFixed(2), entry:+entry.toFixed(8), stop:+stop.toFixed(8), tp1:+tp1.toFixed(8), tp2:+tp2.toFixed(8), last_price:row.last_price, change24h_pct:row.change24h_pct, turnover24h_usdt:row.turnover24h_usdt, age_days:row.age_days };
 }
-function tg(r){ return [`<b>${r.status} — ${r.symbol}</b>`,`score: ${r.score}/100`,`1h: ${r.bullish1h ? 'bullish' : 'bearish'}`,`15m: ${r.bullish15 ? 'confirm' : 'weak'}`,`news: ${r.news ? 'yes' : 'no'}`,`in-play: vol x${r.volSpike}, atr x${r.atrSpike}, spread ${r.spreadPct}%, ws ${r.wsMom}%`,`entry: ${r.entry}`,`sl: ${r.stop}`,`tp1: ${r.tp1}`,`tp2: ${r.tp2}`,`24h: ${r.change24h_pct}% | vol: ${Math.round(r.turnover24h_usdt)} | age: ${r.age_days}d`,`ann: ${ANN_URL}`].join('\n'); }
+
+function tg(r){ return [`${r.status} — ${r.symbol}`,`score: ${r.score}/100`,`1h: ${r.bullish1h ? 'bullish' : 'bearish'}`,`15m: ${r.bullish15 ? 'confirm' : 'weak'}`,`news: ${r.news ? 'yes' : 'no'}`,`in-play: vol x${r.volSpike}, atr x${r.atrSpike}, spread ${r.spreadPct}%, ws ${r.wsMom}%`,`entry: ${r.entry}`,`sl: ${r.stop}`,`tp1: ${r.tp1}`,`tp2: ${r.tp2}`,`24h: ${r.change24h_pct}% | vol: ${Math.round(r.turnover24h_usdt)} | age: ${r.age_days}d`,`ann: ${ANN_URL}`].join('\n'); }
 
 async function updateNews(state){
   const news = await fetchAnnouncements();
@@ -108,7 +173,7 @@ async function updateNews(state){
     if(!state.seenNews.includes(s)){
       state.seenNews.push(s);
       log(`NEWS ${s}`);
-      await postTelegram(`<b>NEWS WATCH</b>\n${s}\nAdded to watch context.\n${ANN_URL}`);
+      await postTelegram(`NEWS WATCH\n${s}\nAdded to watch context.\n${ANN_URL}`).catch(e => log(`TG ERR ${e.message}`));
     }
   }
   state.seenNews = state.seenNews.slice(-200);
@@ -116,21 +181,26 @@ async function updateNews(state){
 }
 
 async function evaluate(state){
-  const universe = await fetchUniverse();
+  let universe = [];
+  try { universe = await fetchUniverse(); } catch (e) { log(`UNIVERSE ERR ${e.message}`); }
   const results = [];
   for(const row of universe.slice(0, 25)){
-    const k15 = await fetchKlines(row.symbol, '15', 120);
-    const k60 = await fetchKlines(row.symbol, '60', 120);
-    if(k15.length < 60 || k60.length < 60) continue;
-    const wsTick = state.cache[row.symbol] || null;
-    const sig = scoreSignal(row, k15, k60, (state.newsSet || []).includes(row.symbol), wsTick);
-    results.push(sig);
-    if(sig.status === 'LONG'){
-      const fp = `${sig.symbol}:${sig.score}:${sig.entry}`;
-      if(state.lastAlert !== fp){
-        state.lastAlert = fp;
-        await postTelegram(tg(sig));
+    try {
+      const k15 = await fetchKlines(row.symbol, '15', 120);
+      const k60 = await fetchKlines(row.symbol, '60', 120);
+      if(k15.length < 60 || k60.length < 60) continue;
+      const wsTick = state.cache[row.symbol] || null;
+      const sig = scoreSignal(row, k15, k60, (state.newsSet || []).includes(row.symbol), wsTick);
+      results.push(sig);
+      if(sig.status === 'LONG'){
+        const fp = `${sig.symbol}:${sig.score}:${sig.entry}`;
+        if(state.lastAlert !== fp){
+          state.lastAlert = fp;
+          await postTelegram(tg(sig)).catch(e => log(`TG ERR ${e.message}`));
+        }
       }
+    } catch (e) {
+      log(`SYMBOL ERR ${row.symbol} ${e.message}`);
     }
   }
   results.sort((a,b) => b.score - a.score);
@@ -140,21 +210,16 @@ async function evaluate(state){
   saveState(state);
 }
 
-function loadState(){ try { return JSON.parse(fs.readFileSync(STATE_FILE,'utf8')); } catch { return {seenNews:[], lastAlert:'', cache:{}, symbols: WATCHLIST.slice(), wsSubscribed:{}, newsSet:[]}; } }
-function saveState(state){ fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2)); }
-
-function subscribeSymbol(ws, symbol){
-  ws.send(JSON.stringify({op:'subscribe', args:[`tickers.${symbol}`]}));
-  ws.send(JSON.stringify({op:'subscribe', args:[`kline.15.${symbol}`]}));
-  ws.send(JSON.stringify({op:'subscribe', args:[`kline.60.${symbol}`]}));
-}
-
 function startWS(state){
   const ws = new WebSocket(WS);
   ws.on('open', () => {
     log('WS connected');
     const syms = state.symbols && state.symbols.length ? state.symbols : WATCHLIST;
-    for(const sym of syms.slice(0, 150)) subscribeSymbol(ws, sym);
+    for(const sym of syms.slice(0, 150)) {
+      ws.send(JSON.stringify({op:'subscribe', args:[`tickers.${sym}`]}));
+      ws.send(JSON.stringify({op:'subscribe', args:[`kline.15.${sym}`]}));
+      ws.send(JSON.stringify({op:'subscribe', args:[`kline.60.${sym}`]}));
+    }
   });
   ws.on('message', raw => {
     try {
@@ -177,11 +242,19 @@ function startWS(state){
   ws.on('error', e => log(`WS error ${e.message}`));
 }
 
+function startHealthServer(){
+  http.createServer((req, res) => {
+    res.writeHead(200, {'Content-Type':'text/plain'});
+    res.end('OK');
+  }).listen(PORT, '0.0.0.0', () => log(`Health server on port ${PORT}`));
+}
+
 async function main(){
   const state = loadState();
   log(`START v5.3 ALERT_SCORE=${ALERT_SCORE}`);
   if(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID) log('Telegram enabled');
   if(WATCHLIST.length) log(`Watchlist: ${WATCHLIST.join(', ')}`);
+  startHealthServer();
   startWS(state);
   await updateNews(state);
   await evaluate(state);
@@ -189,4 +262,5 @@ async function main(){
   setInterval(() => evaluate(state).catch(e => log(`EVAL ${e.message}`)), REST_REFRESH_MS);
   setInterval(() => saveState(state), 10000);
 }
+
 main().catch(e => { log(`FATAL ${e.message}`); process.exit(1); });
