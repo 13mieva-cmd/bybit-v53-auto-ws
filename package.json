@@ -1,0 +1,13 @@
+{
+  "name": "bybit-v53-auto-ws",
+  "version": "1.0.0",
+  "private": true,
+  "type": "commonjs",
+  "main": "bybit_v53_auto_ws.js",
+  "scripts": {
+    "start": "node bybit_v53_auto_ws.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
