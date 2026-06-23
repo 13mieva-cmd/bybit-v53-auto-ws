@@ -2,6 +2,7 @@
 const https = require('https');
 const fs = require('fs');
 const WebSocket = require('ws');
+fs.mkdirSync('output', { recursive: true });
 
 const REST = 'https://api.bybit.com';
 const WS = 'wss://stream.bybit.com/v5/public/spot';
